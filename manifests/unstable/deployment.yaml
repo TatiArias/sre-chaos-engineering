@@ -1,0 +1,40 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: chaos-target-app
+  namespace: chaos-app
+  labels:
+    app: chaos-target-app
+    version: unstable
+spec:
+  replicas: 3
+  strategy:
+    type: Recreate  # ← Changed from RollingUpdate to force all pods down
+  selector:
+    matchLabels:
+      app: chaos-target-app
+  template:
+    metadata:
+      labels:
+        app: chaos-target-app
+        version: unstable
+    spec:
+      containers:
+      - name: app
+        image: nginx:nonexistent-tag  # This will cause ImagePullBackOff
+        ports:
+        - containerPort: 80
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 80
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        volumeMounts:
+        - name: content
+          mountPath: /usr/share/nginx/html/index.html
+          subPath: index.html
+      volumes:
+      - name: content
+        configMap:
+          name: app-content-unstable

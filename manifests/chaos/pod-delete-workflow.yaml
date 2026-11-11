@@ -1,0 +1,175 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  name: pod-delete-chaos-experiment
+  namespace: litmus
+  labels:
+    subject: pod-delete-chaos
+spec:
+  entrypoint: chaos-experiment
+  serviceAccountName: argo-chaos
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+  arguments:
+    parameters:
+      - name: adminModeNamespace
+        value: litmus
+  templates:
+    # Main experiment flow
+    - name: chaos-experiment
+      steps:
+        - - name: install-chaos-experiments
+            template: install-chaos-experiments
+        - - name: run-pod-delete
+            template: pod-delete-chaos
+        - - name: cleanup
+            template: revert-chaos
+
+    # Step 1: Install the ChaosExperiment CRD
+    - name: install-chaos-experiments
+      inputs:
+        artifacts:
+          - name: pod-delete
+            path: /tmp/pod-delete.yaml
+            raw:
+              data: |
+                apiVersion: litmuschaos.io/v1alpha1
+                kind: ChaosExperiment
+                metadata:
+                  name: pod-delete
+                  namespace: {{workflow.parameters.adminModeNamespace}}
+                  labels:
+                    name: pod-delete
+                    app.kubernetes.io/part-of: litmus
+                    app.kubernetes.io/component: chaosexperiment
+                    app.kubernetes.io/version: 3.0.0
+                spec:
+                  definition:
+                    scope: Namespaced
+                    permissions:
+                      - apiGroups: [""]
+                        resources: ["pods", "events"]
+                        verbs: ["create", "list", "get", "patch", "update", "delete", "deletecollection"]
+                      - apiGroups: [""]
+                        resources: ["pods/log"]
+                        verbs: ["get", "list", "watch"]
+                      - apiGroups: ["batch"]
+                        resources: ["jobs"]
+                        verbs: ["create", "list", "get", "delete", "deletecollection"]
+                      - apiGroups: ["litmuschaos.io"]
+                        resources: ["chaosengines", "chaosexperiments", "chaosresults"]
+                        verbs: ["create", "list", "get", "patch", "update", "delete"]
+                    image: "litmuschaos/go-runner:latest"
+                    imagePullPolicy: Always
+                    args:
+                      - -c
+                      - ./experiments -name pod-delete
+                    command:
+                      - /bin/bash
+                    env:
+                      - name: TOTAL_CHAOS_DURATION
+                        value: "30"
+                      - name: RAMP_TIME
+                        value: "0"
+                      - name: FORCE
+                        value: "true"
+                      - name: CHAOS_INTERVAL
+                        value: "10"
+                      - name: PODS_AFFECTED_PERC
+                        value: ""
+                      - name: LIB
+                        value: "litmus"
+                      - name: TARGET_PODS
+                        value: ""
+                      - name: SEQUENCE
+                        value: "parallel"
+                    labels:
+                      name: pod-delete
+                      app.kubernetes.io/part-of: litmus
+                      app.kubernetes.io/component: experiment-job
+      container:
+        image: bitnami/kubectl:latest
+        command: [sh, -c]
+        args: 
+          - kubectl apply -f /tmp/pod-delete.yaml -n {{workflow.parameters.adminModeNamespace}}
+
+    # Step 2: Run the actual chaos experiment via ChaosEngine
+    - name: pod-delete-chaos
+      inputs:
+        artifacts:
+          - name: chaosengine
+            path: /tmp/chaosengine.yaml
+            raw:
+              data: |
+                apiVersion: litmuschaos.io/v1alpha1
+                kind: ChaosEngine
+                metadata:
+                  name: pod-delete-engine
+                  namespace: {{workflow.parameters.adminModeNamespace}}
+                spec:
+                  appinfo:
+                    appns: chaos-app
+                    applabel: 'app=chaos-target-app'
+                    appkind: deployment
+                  engineState: active
+                  chaosServiceAccount: argo-chaos
+                  experiments:
+                    - name: pod-delete
+                      spec:
+                        components:
+                          env:
+                            - name: TOTAL_CHAOS_DURATION
+                              value: "30"
+                            - name: CHAOS_INTERVAL
+                              value: "10"
+                            - name: FORCE
+                              value: "false"
+                            - name: PODS_AFFECTED_PERC
+                              value: "50"
+      container:
+        image: bitnami/kubectl:latest
+        command: [sh, -c]
+        args:
+          - |
+            kubectl apply -f /tmp/chaosengine.yaml -n {{workflow.parameters.adminModeNamespace}}
+            echo "ChaosEngine created. Waiting for chaos runner to start..."
+            sleep 5
+            
+            echo "Monitoring ChaosResult status..."
+            # Wait up to 90 seconds for chaos to complete
+            for i in $(seq 1 90); do
+              PHASE=$(kubectl get chaosresult pod-delete-engine-pod-delete -n {{workflow.parameters.adminModeNamespace}} -o jsonpath='{.status.experimentStatus.phase}' 2>/dev/null || echo "NotFound")
+              VERDICT=$(kubectl get chaosresult pod-delete-engine-pod-delete -n {{workflow.parameters.adminModeNamespace}} -o jsonpath='{.status.experimentStatus.verdict}' 2>/dev/null || echo "Unknown")
+              
+              echo "[$i/90] Phase: $PHASE | Verdict: $VERDICT"
+              
+              # Exit when chaos reaches a final state
+              if [ "$PHASE" = "Completed" ]; then
+                echo "✅ Chaos experiment completed successfully!"
+                break
+              elif [ "$PHASE" = "Stopped" ] || [ "$PHASE" = "Error" ]; then
+                echo "⚠️  Chaos experiment ended with phase: $PHASE"
+                break
+              fi
+              
+              sleep 1
+            done
+            
+            echo ""
+            echo "=== Final ChaosResult ==="
+            kubectl get chaosresult -n {{workflow.parameters.adminModeNamespace}}
+            echo ""
+            kubectl describe chaosresult pod-delete-engine-pod-delete -n {{workflow.parameters.adminModeNamespace}} | grep -A 10 "Status:"
+
+    # Step 3: Cleanup
+    - name: revert-chaos
+      container:
+        image: bitnami/kubectl:latest
+        command: [sh, -c]
+        args:
+          - |
+            echo "Cleaning up chaos resources..."
+            kubectl delete chaosengine pod-delete-engine -n {{workflow.parameters.adminModeNamespace}} --ignore-not-found=true
+            kubectl delete chaosexperiment pod-delete -n {{workflow.parameters.adminModeNamespace}} --ignore-not-found=true
+            echo "Cleanup completed"

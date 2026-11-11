@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-content-unstable
+  namespace: chaos-app
+data:
+  index.html: |
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Chaos Engineering Target - UNSTABLE</title>
+    </head>
+    <body>
+        <h1>Chaos Engineering Target - BROKEN</h1>
+    </body>
+    </html>
